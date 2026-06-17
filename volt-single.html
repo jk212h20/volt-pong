@@ -46,15 +46,22 @@ function resize(){
   vw = window.innerWidth; vh = window.innerHeight;
   canvas.width = Math.round(vw*dpr); canvas.height = Math.round(vh*dpr);
   canvas.style.width = vw+'px'; canvas.style.height = vh+'px';
-  // Reserve space at bottom for horizontal button bar
-  const bottomBar = 72;
+
+  const mobileLayout = (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) || vw <= 700;
+  // Reserve space at bottom for horizontal button bar. Mobile gets a little
+  // extra room so the playfield can shrink and the player can aim below the
+  // paddle without covering it with their finger.
+  const bottomBar = mobileLayout ? 84 : 72;
   const availH = vh - bottomBar;
   let fW = vw*0.96, fH = fW*H/W;
   if(fH > availH*0.98){ fH = availH*0.98; fW = fH*W/H; }
+  if(mobileLayout){ fW*=0.90; fH*=0.90; }
   scale = fW/W;
-  // Center field horizontally, top-align in available space
   fx = (vw-fW)/2;
-  fy = (availH-fH)/2;
+  // Slightly top-bias on mobile: keep walls away from screen edges and leave
+  // more usable space below the paddle/button row for thumb control.
+  const spareY = Math.max(0, availH-fH);
+  fy = mobileLayout ? spareY*0.35 : spareY/2;
 }
 window.addEventListener('resize', resize);
 
@@ -127,6 +134,8 @@ const SPLIT_DELAY=0.18;
 
 /* ---------- Energy Eater (persistent hazard) ---------- */
 const EATER_R=20;
+const TOKEN_COLLECT_PAD=4; // forgiving coin pickup radius
+const EATER_HIT_PAD=-4;    // slightly stricter eater collision radius
 const EATER_ORBIT_R=75;   // orbit radius around its anchor point
 const EATER_ORBIT_SPD=0.6; // rad/s
 const eater={ cx:W/2, cy:H/2, x:W/2, y:H/2, ang:0, flash:0 };
@@ -896,10 +905,10 @@ function update(dt){
     // ── COMMON checks for ALL balls (trailing + real) ──
     // token collection
     for(const tk of tokens){
-      if(!tk.dead && Math.hypot(b.x-tk.x,b.y-tk.y)<b.r+tk.r){ collectToken(tk,b); }
+      if(!tk.dead && Math.hypot(b.x-tk.x,b.y-tk.y)<b.r+tk.r+TOKEN_COLLECT_PAD){ collectToken(tk,b); }
     }
     // energy eater
-    if(Math.hypot(b.x-eater.x,b.y-eater.y)<b.r+EATER_R){ hitEater(b); }
+    if(Math.hypot(b.x-eater.x,b.y-eater.y)<b.r+EATER_R+EATER_HIT_PAD){ hitEater(b); }
     // paddle collisions
     if(b.vy>0) doPaddleCheck(b,player,true);
     if(b.vy<0) doPaddleCheck(b,ai,false);
