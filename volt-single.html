@@ -1,0 +1,1504 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#05060f">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="mobile-web-app-capable" content="yes">
+<title>VOLT — Spin Pong</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body{
+    width:100%; height:100%; overflow:hidden; position:fixed; inset:0;
+    background:#05060f;
+    font-family:'Segoe UI',system-ui,-apple-system,Roboto,Arial,sans-serif;
+    color:#cfe9ff;
+    -webkit-tap-highlight-color:transparent;
+    touch-action:none;
+    overscroll-behavior:none;
+    user-select:none; -webkit-user-select:none;
+  }
+  #game{ display:block; position:fixed; inset:0; width:100%; height:100%; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<script>
+"use strict";
+/* =====================================================================
+   VOLT v2 — Spin Pong
+   Real spin physics (Magnus), flat paddles, energy economy,
+   energy economy, trailing multi-ball for pincer plays.
+   Logical play field: 540 x 960 (portrait).
+   ===================================================================== */
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = 540, H = 860;
+
+/* ---------- Screen / scaling ---------- */
+let vw=0, vh=0, dpr=1, fx=0, fy=0, scale=1;
+function resize(){
+  dpr = Math.min(window.devicePixelRatio||1, 2.5);
+  vw = window.innerWidth; vh = window.innerHeight;
+  canvas.width = Math.round(vw*dpr); canvas.height = Math.round(vh*dpr);
+  canvas.style.width = vw+'px'; canvas.style.height = vh+'px';
+  // Reserve space at bottom for horizontal button bar
+  const bottomBar = 72;
+  const availH = vh - bottomBar;
+  let fW = vw*0.96, fH = fW*H/W;
+  if(fH > availH*0.98){ fH = availH*0.98; fW = fH*W/H; }
+  scale = fW/W;
+  // Center field horizontally, top-align in available space
+  fx = (vw-fW)/2;
+  fy = (availH-fH)/2;
+}
+window.addEventListener('resize', resize);
+
+/* ---------- Physics constants ---------- */
+/*
+  CONTACT-POINT FRICTION MODEL (hollow-shell ball, I = 2/3 mR²)
+  ─────────────────────────────────────────────────────────────
+  Friction acts on the CONTACT POINT velocity, not the center velocity.
+  v_contact = v_center + ω×r,  so a spinning ball's surface slides even
+  when the center is still.  Friction drives slip toward zero (grip) or is
+  capped by μ × normal-impulse (Coulomb sliding).
+
+  slip = v_tangential − spin × SPIN_SURFACE
+
+  Grip case (friction eliminates slip):
+    Δv_t   = −(2/5) × slip         (center tangential velocity drops)
+    Δspin  = +(3/5) × slip / SS    (spin adjusts toward rolling)
+
+  Sliding case (Coulomb-capped):
+    Δv_t   = −sign(slip) × μJn
+    Δspin  = +sign(slip) × (3/2)μJn / SS
+
+  Same equation for walls and paddles — just step into the surface's frame.
+*/
+const K_MAGNUS      = 0.36;   // Magnus force coefficient (flight curve)
+const SPIN_SURFACE  = 120;    // game-spin → contact-point surface speed (px/s)
+const SPIN_DECAY    = 0.35;   // in-flight exponential spin decay per second
+const CONTACT_SPIN_DAMP = 0.55;  // spin multiplied by this on every wall/paddle hit
+const WALL_REST     = 0.92;   // wall coefficient of restitution
+const WALL_MU       = 0.03;   // wall friction (nearly frictionless — smooth boundary)
+const PAD_MU        = 0.35;   // paddle friction coefficient (grippy rubber)
+const SPIN_MAX      = 3.5;
+const MIN_SPEED     = 480;   // base floor; rises with rally length (see minSpeed())
+const MAX_SPEED     = 1400;
+function minSpeed(){
+  // Each rally hit raises the floor by 8px/s, up to +200
+  return MIN_SPEED + Math.min(rallyHits*8, 200);
+}
+const RALLY_SPEEDUP = 1.035;
+
+/* ---------- Angled wall system ---------- */
+// 2% wall slope: the hitter's side narrows, funneling the ball toward the opponent.
+// Player hits → bottom narrows → ball pushed up toward AI.
+// AI hits → top narrows → ball pushed down toward player.
+// Slope smoothly transitions over ~2s when direction flips.
+const WALL_SLOPE = 0.04;      // max wall offset as fraction of W
+const WALL_TRANSITION = 2.0;  // seconds to ease between slopes
+const WALL_SLOPE_LOCK = 1.5;  // min seconds a slope target must hold before flipping
+let wallSlope = 0;            // current interpolated slope (-WALL_SLOPE .. +WALL_SLOPE)
+let wallSlopeTarget = 0;      // target slope
+let wallSlopeLockT = 0;       // countdown: can't change target until this hits 0
+function setSlopeTarget(){
+  // Player hit last (0) → player's side narrows → positive slope.
+  // The narrowing walls bounce the ball toward the opponent (AI at top).
+  const newTarget = (lastHitter===0) ? WALL_SLOPE : -WALL_SLOPE;
+  if(wallSlopeLockT>0 && newTarget!==wallSlopeTarget) return; // locked, ignore flip
+  wallSlopeTarget = newTarget;
+  wallSlopeLockT = WALL_SLOPE_LOCK;
+}
+// ── Single source of truth for wall position at any y ──
+function wallLeftAt(y){  return wallSlope * W * (y / H); }
+function wallRightAt(y){ return W - wallSlope * W * (y / H); }
+
+/* ---------- Energy / ability constants ---------- */
+const GROW_COST=10, GROW_DUR=8,  GROW_MULT=1.65;
+const SLOW_COST=10, SLOW_DUR=8;
+const SPLIT_COST=10;
+const MOVE_COST=10;
+const SPLIT_DELAY=0.18;
+
+/* ---------- Energy Eater (persistent hazard) ---------- */
+const EATER_R=20;
+const EATER_ORBIT_R=75;   // orbit radius around its anchor point
+const EATER_ORBIT_SPD=0.6; // rad/s
+const eater={ cx:W/2, cy:H/2, x:W/2, y:H/2, ang:0, flash:0 };
+function resetEater(){
+  eater.cx=rand(80,W-80);
+  eater.cy=rand(H*0.28,H*0.72);
+  eater.ang=rand(0,6.28);
+}
+function relocateEaterAfterHit(owner){
+  // Move to a different horizontal side, with a small vertical bias toward the
+  // player who did NOT just hit this ball. This keeps it feeling reactive
+  // instead of teleporting to a completely unrelated random spot.
+  if(owner!==0 && owner!==1){ resetEater(); return; }
+  const margin=80;
+  const oldLeft = eater.cx < W/2;
+  eater.cx = oldLeft ? rand(W/2+margin*0.35, W-margin) : rand(margin, W/2-margin*0.35);
+  const otherY = owner===0 ? ai.y : player.y;
+  const towardOther = Math.sign(otherY - eater.cy) || (owner===0 ? -1 : 1);
+  const targetY = eater.cy + towardOther*EATER_R*rand(0.75,1.35);
+  eater.cy = clamp(targetY, H*0.28, H*0.72);
+  eater.ang=rand(0,6.28);
+}
+let energyFlashT=0;   // red flash timer when player loses energy
+function hitEater(b){
+  // The owner is the player who last hit THIS ball. Newly-served neutral balls
+  // have owner=-1 and are ignored before they touch a paddle.
+  if(b.owner===0){
+    player.energy=0;
+  } else if(b.owner===1){
+    ai.energy=0;
+  } else {
+    return;
+  }
+  eater.flash=1;
+  emit('eater',{bx:b.x,by:b.y,playerSide:b.owner===0});
+  relocateEaterAfterHit(b.owner);
+}
+
+/* ---------- Input ---------- */
+const input = { targetX:W/2, left:false, right:false, activeTouch:null };
+function s2x(cx){ return (cx-fx)/scale; }
+function s2y(cy){ return (cy-fy)/scale; }
+
+// Pointer drives paddle unless it hits an ability button
+let pointerOnButton = false;
+function pointerMove(cx){ if(!pointerOnButton) input.targetX = s2x(cx); }
+
+canvas.addEventListener('mousemove', e=>pointerMove(e.clientX));
+canvas.addEventListener('mousedown', e=>{
+  if(!checkSideButtonsHit(e.clientX,e.clientY,true)) pointerMove(e.clientX);
+});
+canvas.addEventListener('mouseup', ()=>{ pointerOnButton=false; });
+
+canvas.addEventListener('touchstart', e=>{
+  e.preventDefault();
+  const t=e.changedTouches[0];
+  input.activeTouch=t.identifier;
+  const lx=s2x(t.clientX);
+  pointerOnButton=false;
+  if(!checkSideButtonsHit(t.clientX,t.clientY,true)) input.targetX=lx;
+  if(state!=='playing' && state!=='gameover' && state!=='menu') {}
+  if(state==='menu'||state==='gameover'){
+    const by=s2y(t.clientY);
+    if(by>H*0.40 && by<H*0.66) startGame();
+  }
+},{passive:false});
+canvas.addEventListener('touchmove', e=>{
+  e.preventDefault();
+  for(const t of e.changedTouches){
+    if(t.identifier===input.activeTouch && !pointerOnButton){
+      input.targetX=s2x(t.clientX);
+    }
+  }
+},{passive:false});
+function endTouch(e){ e.preventDefault(); pointerOnButton=false; }
+canvas.addEventListener('touchend',endTouch,{passive:false});
+canvas.addEventListener('touchcancel',endTouch,{passive:false});
+
+window.addEventListener('keydown', e=>{
+  if(e.key==='ArrowLeft'||e.key==='a'||e.key==='A') input.left=true;
+  if(e.key==='ArrowRight'||e.key==='d'||e.key==='D') input.right=true;
+  if(e.key==='1'||e.key==='q'||e.key==='Q') tryAbility('grow');
+  if(e.key==='2'||e.key==='w'||e.key==='W') tryAbility('slow');
+  if(e.key==='3'||e.key==='e'||e.key==='E') tryAbility('split');
+  if(e.key==='4'||e.key==='r'||e.key==='R') tryAbility('move');
+  if(e.key==='p'||e.key==='P'||e.key==='Escape'){ if(state==='playing'){paused=!paused;} }
+  if(e.key==='Enter'){ if(state==='menu'||state==='gameover') startGame(); }
+});
+window.addEventListener('keyup', e=>{
+  if(e.key==='ArrowLeft'||e.key==='a'||e.key==='A') input.left=false;
+  if(e.key==='ArrowRight'||e.key==='d'||e.key==='D') input.right=false;
+});
+
+/* ---------- Audio ---------- */
+let AC=null;
+function audioInit(){ if(AC) return; try{ AC=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){AC=null;} }
+function blip(freq,dur,type,vol,slide){
+  if(!AC) return; const t=AC.currentTime;
+  const o=AC.createOscillator(),g=AC.createGain();
+  o.type=type||'square'; o.frequency.setValueAtTime(freq,t);
+  if(slide) o.frequency.exponentialRampToValueAtTime(Math.max(40,slide),t+dur);
+  g.gain.setValueAtTime(0.0001,t);
+  g.gain.exponentialRampToValueAtTime(vol||0.16,t+0.005);
+  g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+  o.connect(g); g.connect(AC.destination); o.start(t); o.stop(t+dur+0.02);
+}
+function noiseBurst(dur,vol){
+  if(!AC) return; const t=AC.currentTime;
+  const n=Math.floor(AC.sampleRate*dur), buf=AC.createBuffer(1,n,AC.sampleRate), d=buf.getChannelData(0);
+  for(let i=0;i<n;i++) d[i]=(Math.random()*2-1)*(1-i/n);
+  const s=AC.createBufferSource(); s.buffer=buf;
+  const g=AC.createGain(); g.gain.value=vol||0.1;
+  const f=AC.createBiquadFilter(); f.type='highpass'; f.frequency.value=800;
+  s.connect(f); f.connect(g); g.connect(AC.destination); s.start(t);
+}
+const SFX={
+  paddle:(sp)=>blip(260+Math.min(Math.abs(sp),4)*60, 0.08,'square',0.18),
+  wall:()=>blip(160,0.05,'triangle',0.1),
+  token:()=>blip(880,0.06,'sine',0.12,1320),
+  ability:()=>blip(440,0.1,'square',0.16,660),
+  score:()=>blip(523,0.12,'square',0.2,784),
+  lose:()=>blip(200,0.25,'sawtooth',0.18,80),
+  win:()=>{[523,659,784,1047].forEach((f,i)=>setTimeout(()=>blip(f,0.15,'square',0.2),i*110));},
+};
+
+/* ---------- Game state ---------- */
+let state='menu';
+let paused=false;
+
+/* ---------- Seeded PRNG (deterministic for multiplayer/replay) ---------- */
+// mulberry32 — fast, deterministic across all JS engines (integer math only).
+// Replaces Math.random() in all SIMULATION code. Visual-only randomness
+// (particles, screen shake jitter) still uses Math.random() freely.
+let _simSeed = 0x12345678;   // default seed; startGame() reseeds
+function simRand(){
+  // The |0 and >>>0 force 32-bit integer math — identical on every JS engine.
+  _simSeed = (_simSeed + 0x6D2B79F5) | 0;
+  let t = _simSeed;
+  t = Math.imul(t ^ (t >>> 15), t | 1);
+  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+// Drop-in replacement for rand() in sim contexts
+function simRandRange(a,b){ return a + simRand()*(b-a); }
+let WIN_SCORE=7;
+let pScore=0, aScore=0;
+let rallyHits=0;
+let lastHitter=0;      // 0=player,1=ai
+let tokenStreak=0;     // tokens collected since last paddle hit
+let gameTime=0, lastTime=0;
+let serveTimer=0, serveDir=1;
+let winner='';
+let shake=0, hitstop=0;
+function addShake(a){ shake=Math.min(shake+a,28); }
+
+/* ---------- Sim event queue (decouples physics from side effects) ---------- */
+// Physics code pushes events; processFx() drains them after each fixed step.
+// This makes update() a pure state mutation — savable/restorable for rollback.
+let simEvents = [];
+function emit(type, data){ simEvents.push({type, data: data||null}); }
+
+function processFx(){
+  for(const e of simEvents){
+    switch(e.type){
+      case 'wall':     SFX.wall(); burst(e.data.x,e.data.y,6,['#5be0ff'],140,3,0.35); addShake(2); break;
+      case 'paddle':   addShake(e.data.player?5:3);
+                      burst(e.data.x,e.data.y,10,[Math.abs(e.data.spin)>2?'#fbbf24':'#5be0ff','#fff'],200,3.5,0.5);
+                      SFX.paddle(e.data.spin); break;
+      case 'token':    SFX.token();
+                      burst(e.data.x,e.data.y,8,['#ffd166','#fff3b0'],160,3,0.4);
+                      addFloatText(e.data.x,e.data.y-20,'+'+e.data.streak,'#ffd166',14+Math.min(e.data.streak,6)*2);
+                      if(e.data.playerSide){ burst(player.x,player.y-30,3,['#ffd166'],80,2,0.3); } break;
+      case 'ability':  SFX.ability(); addShake(e.data.shake||4);
+                      if(e.data.burst) burst(e.data.bx,e.data.by,e.data.n,e.data.colors,e.data.spd,e.data.sz,e.data.life); break;
+      case 'split':    burst(e.data.x,e.data.y,18,['#fbbf24','#fff'],220,4,0.5); break;
+      case 'eater':    addShake(12);
+                      burst(e.data.bx,e.data.by,24,['#ff4da6','#ff2266','#bda6ff'],280,5,0.8);
+                      if(e.data.playerSide){ energyFlashT=0.8; burst(player.x,player.y-30,20,['#ff2266','#ff0000'],220,4,0.7); }
+                      SFX.lose(); break;
+      case 'score':    SFX.score(); addShake(8); break;
+      case 'win':      SFX.win(); break;
+      case 'lose':     SFX.lose(); break;
+    }
+  }
+  simEvents.length = 0;
+}
+
+/* ---------- Entities ---------- */
+const balls=[];
+const particles=[];
+const tokens=[];
+function makeBall(x,y,vx,vy){
+  return { x,y,vx,vy, r:9, spin:0, trail:[], path:[], speedMul:1, alive:true,
+           leader:null, leaderDelay:SPLIT_DELAY, detached:false, dupIndex:0, owner:-1, hitTime:0 };
+}
+function resetBall(dir){
+  balls.length=0;
+  const speed=500;
+  const ang=(simRand()*0.4-0.2);
+  const b=makeBall(W/2, H*0.5, Math.sin(ang)*speed, Math.cos(ang)*speed*dir);
+  b.owner = -1;             // neutral serve: no token/eater credit until paddle hit
+  b.hitTime = gameTime;
+  balls.push(b);
+  wallSlopeTarget = 0;       // neutral ball starts with straight walls
+  wallSlopeLockT=0;
+}
+
+/* ---------- Paddles ---------- */
+const player = { x:W/2, y:H-64, w:120, h:16, vx:0, hist:[], baseW:120, growT:0, slowT:0, energy:0 };
+const ai     = { x:W/2, y:64,   w:120, h:16, vx:0, hist:[], baseW:120, energy:0, growT:0, slowT:0 };
+
+const SPIN_WINDOW=0.5;
+const SPIN_RECENT=0.08; // last ~5 frames get extra weight (the "flick" at contact)
+const SPIN_RECENT_WEIGHT=0.6;  // how much the recent burst counts vs full-window avg
+function motionVel(pad){
+  const h=pad.hist; if(h.length<2) return 0;
+  // Full-window average velocity
+  const a=h[0], b=h[h.length-1]; const dt=b.t-a.t;
+  const avgVel = dt<0.01?0:(b.x-a.x)/dt;
+  // Recent velocity — just the last SPIN_RECENT seconds before contact
+  const cutoff = b.t - SPIN_RECENT;
+  let r=null; for(let i=h.length-1;i>=0;i--){ if(h[i].t<=cutoff){r=h[i];break;} }
+  const r0 = r||a; const rdt = b.t-r0.t;
+  const recentVel = rdt<0.01?0:(b.x-r0.x)/rdt;
+  // Blend: recent flick gets amplified, but full sweep direction still matters
+  return recentVel*SPIN_RECENT_WEIGHT + avgVel*(1-SPIN_RECENT_WEIGHT);
+}
+function recordHist(pad){
+  pad.hist.push({x:pad.x,t:gameTime});
+  while(pad.hist.length && gameTime-pad.hist[0].t>SPIN_WINDOW) pad.hist.shift();
+}
+
+/* ---------- Helpers ---------- */
+function clamp(v,a,b){ return v<a?a:(v>b?b:v); }
+// sim-safe random: used by spawnToken, resetEater (deterministic)
+function rand(a,b){ return a+simRand()*(b-a); }
+
+/* ---------- Ability buttons (canvas-drawn, hit-tested) ---------- */
+// ── Unified button system: 4 abilities + pause, screen-space, left of field ──
+// Same layout used for menu explanation and in-game buttons.
+const BTN_GAP=4;
+const BTN_H=48;
+const abtns=[
+  { key:'grow',  label:'GROW',  icon:'⬆', col:'#fbbf24', cost:GROW_COST, sx:0,sy:0,sw:0,sh:0 },
+  { key:'slow',  label:'SLOW',  icon:'~',  col:'#c084fc', cost:SLOW_COST, sx:0,sy:0,sw:0,sh:0 },
+  { key:'split', label:'SPLIT', icon:'◉', col:'#f0f0f0', cost:SPLIT_COST, sx:0,sy:0,sw:0,sh:0 },
+  { key:'move',  label:'MOVE',  icon:'✧', col:'#ff3344', cost:MOVE_COST, sx:0,sy:0,sw:0,sh:0 },
+];
+let pauseBtn={ sx:0,sy:0,sw:0,sh:0 };
+
+// Compute button positions in screen space (horizontal row below field)
+// Buttons fill the exact rendered field width, centered to the board
+function getButtonPositions(){
+  const fieldW = W * scale;         // rendered field width on screen
+  const n = 5;                       // 4 abilities + pause
+  const btnW = (fieldW - BTN_GAP*(n-1)) / n;
+  const startX = fx;                 // left-align with field
+  const startY = fy + H*scale + 12;  // below the field
+  return { startX, startY, btnW };
+}
+
+function drawSideButtons(showActive){
+  const { startX, startY, btnW } = getButtonPositions();
+  for(let i=0;i<abtns.length;i++){
+    const b=abtns[i];
+    b.sx=startX+i*(btnW+BTN_GAP); b.sy=startY; b.sw=btnW; b.sh=BTN_H;
+    const active = showActive && (
+      (b.key==='grow'&&player.growT>0) || (b.key==='slow'&&player.slowT>0)
+    );
+    const afford = showActive ? player.energy>=b.cost : false;
+    drawSideButton(b.sx,b.sy,btnW,b, active, afford);
+  }
+  // pause button at the end of the row
+  pauseBtn.sx=startX+4*(btnW+BTN_GAP); pauseBtn.sy=startY;
+  pauseBtn.sw=btnW; pauseBtn.sh=BTN_H;
+  if(showActive){
+    drawPauseButton(pauseBtn.sx, pauseBtn.sy, btnW);
+  }
+}
+function drawSideButton(x,y,w,b,active,afford){
+  ctx.save();
+  ctx.globalAlpha = afford?1:0.4;
+  ctx.fillStyle = active?'rgba(251,191,36,0.2)':'rgba(20,30,55,0.85)';
+  ctx.strokeStyle = afford?(active?'#fbbf24':b.col):'rgba(90,160,200,0.3)';
+  ctx.lineWidth=1.5;
+  const h=BTN_H,r=8;
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+  ctx.fill(); ctx.stroke();
+  ctx.globalAlpha=1;
+  // Font size scales with button width
+  const fs = Math.max(11, Math.min(18, w*0.22));
+  ctx.fillStyle = afford?b.col:'rgba(120,140,170,0.5)';
+  ctx.font='bold '+fs+'px system-ui'; ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText(b.icon+' '+b.label, x+w/2, y+h/2);
+  ctx.restore();
+}
+function drawPauseButton(x,y,w){
+  const h=BTN_H,r=8;
+  ctx.save();
+  ctx.fillStyle = paused?'rgba(251,191,36,0.2)':'rgba(20,30,55,0.85)';
+  ctx.strokeStyle = paused?'#fbbf24':'#5be0ff';
+  ctx.lineWidth=1.5;
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+  ctx.fill(); ctx.stroke();
+  ctx.fillStyle='#cfe9ff';
+  const fs = Math.max(10, Math.min(16, w*0.20));
+  ctx.font='bold '+fs+'px system-ui'; ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText(paused?'▶':'⏸', x+w/2, y+h/2);
+  ctx.restore();
+}
+function checkSideButtonsHit(clientX,clientY,isDown){
+  for(const b of abtns){
+    if(clientX>=b.sx&&clientX<=b.sx+b.sw&&clientY>=b.sy&&clientY<=b.sy+b.sh){
+      if(isDown && state==='playing'){ tryAbility(b.key); pointerOnButton=true; }
+      return true;
+    }
+  }
+  if(clientX>=pauseBtn.sx&&clientX<=pauseBtn.sx+pauseBtn.sw&&clientY>=pauseBtn.sy&&clientY<=pauseBtn.sy+pauseBtn.sh){
+    if(isDown && state==='playing'){ paused=!paused; pointerOnButton=true; }
+    return true;
+  }
+  return false;
+}
+function tryAbility(key){
+  if(state!=='playing') return;
+  const p=player;
+  if(key==='grow' && p.energy>=GROW_COST && p.growT<=0){ p.energy-=GROW_COST; p.growT=GROW_DUR;
+    emit('ability',{shake:4,burst:true,bx:p.x,by:p.y,n:14,colors:['#fbbf24','#fff'],spd:180,sz:4,life:0.5}); }
+  else if(key==='slow' && p.energy>=SLOW_COST && p.slowT<=0){ p.energy-=SLOW_COST; p.slowT=SLOW_DUR;
+    emit('ability',{shake:4,burst:true,bx:W/2,by:H*0.75,n:16,colors:['#c084fc','#fff'],spd:200,sz:4,life:0.6}); }
+  else if(key==='split' && p.energy>=SPLIT_COST){
+    if(doSplit()){
+      p.energy-=SPLIT_COST;
+      emit('ability',{shake:6});
+    }
+  }
+  else if(key==='move' && p.energy>=MOVE_COST){ p.energy-=MOVE_COST; resetEater();
+    emit('ability',{shake:5,burst:true,bx:eater.cx,by:eater.cy,n:20,colors:['#ff3344','#fff'],spd:220,sz:4,life:0.6}); }
+}
+function findSplitLeader(){
+  // Chain from the most recently-created ball, but only once it has enough
+  // history for a follower to trail. spawnSplitBall() seeds that history, so
+  // rapid purchases can still create a clean 3-ball train instead of a stack.
+  for(let i=balls.length-1;i>=0;i--){
+    const b=balls[i];
+    if(b.alive && b.path.length>1) return b;
+  }
+  for(let i=balls.length-1;i>=0;i--){
+    const b=balls[i];
+    if(b.alive) return b;
+  }
+  return null;
+}
+function pathPoint(x,y,t,vx,vy,spin){ return {x,y,t,vx,vy,spin}; }
+function sampleBallPath(path, targetT, fallback){
+  if(!path.length) return fallback;
+  if(targetT<=path[0].t) return path[0];
+  for(let i=1;i<path.length;i++){
+    const a=path[i-1], b=path[i];
+    if(targetT<=b.t){
+      const u = (b.t===a.t) ? 0 : clamp((targetT-a.t)/(b.t-a.t),0,1);
+      return {
+        x:a.x+(b.x-a.x)*u, y:a.y+(b.y-a.y)*u, t:targetT,
+        vx:a.vx+(b.vx-a.vx)*u, vy:a.vy+(b.vy-a.vy)*u,
+        spin:a.spin+(b.spin-a.spin)*u
+      };
+    }
+  }
+  return path[path.length-1];
+}
+function seedSplitFollowerPath(t, leader){
+  const delay = t.leaderDelay;
+  const fallbackNow = pathPoint(leader.x - leader.vx*delay, leader.y - leader.vy*delay,
+                                gameTime, leader.vx, leader.vy, leader.spin);
+  const current = sampleBallPath(leader.path, gameTime-delay, fallbackNow);
+  t.x=current.x; t.y=current.y; t.vx=current.vx||leader.vx; t.vy=current.vy||leader.vy; t.spin=current.spin||leader.spin;
+
+  // Build the follower's OWN history, shifted by delay from the leader's
+  // history. This is the important bit for rapid-fire splitting: a child split
+  // from this follower samples positions another delay behind, instead of
+  // copying the original leader path and stacking on top of its parent.
+  t.path.length=0;
+  for(const p of leader.path){
+    const ft = p.t + delay;
+    if(ft<=gameTime) t.path.push(pathPoint(p.x,p.y,ft,p.vx,p.vy,p.spin));
+  }
+  if(t.path.length===0){
+    t.path.push(pathPoint(t.x - t.vx*delay, t.y - t.vy*delay, gameTime-delay, t.vx,t.vy,t.spin));
+  }
+  t.path.push(pathPoint(t.x,t.y,gameTime,t.vx,t.vy,t.spin));
+  while(t.path.length>120) t.path.shift();
+}
+function spawnSplitBall(leader){
+  if(!leader || !leader.alive) return false;
+  const t=makeBall(leader.x, leader.y, leader.vx, leader.vy);
+  t.leader=leader; t.detached=false;
+  t.dupIndex = leader.dupIndex + 1;
+  t.owner = leader.owner;   // inherit owner from leader
+  t.hitTime = leader.hitTime;
+  seedSplitFollowerPath(t, leader);
+  balls.push(t);
+  emit('split',{x:leader.x,y:leader.y});
+  return true;
+}
+function doSplit(){
+  return spawnSplitBall(findSplitLeader());
+}
+
+/* ---------- Tokens ---------- */
+function spawnToken(){
+  tokens.push({ x:rand(50,W-50), y:rand(H*0.25,H*0.75), r:16, bob:rand(0,6.28), dead:false, collected:false });
+}
+function collectToken(tk,b){
+  if(!b || (b.owner!==0 && b.owner!==1)) return; // neutral served balls cannot collect energy
+  tk.collected=true; tk.dead=true;
+  tokenStreak++;
+  emit('token',{x:tk.x,y:tk.y,streak:tokenStreak,playerSide:b.owner===0});
+  // ── award energy IMMEDIATELY using triangular increment (2n-1) ──
+  // so n tokens total = n² energy, same formula but no waiting for paddle hit.
+  const gained = tokenStreak;
+  if(b.owner===0){ player.energy=Math.min(player.energy+gained,99); }
+  else { ai.energy=Math.min(ai.energy+gained,99); }
+}
+
+/* ---------- Floating texts ---------- */
+const floatTexts=[];
+function addFloatText(x,y,text,col,size){
+  floatTexts.push({x,y, text,col, size:size||18, age:0, life:0.9, vy:-50});
+}
+
+/* ---------- Particles ---------- */
+function burst(x,y,n,colors,spd,size,life){
+  for(let i=0;i<n;i++){
+    const a=Math.random()*6.28, s=spd*(0.4+Math.random()*0.8);
+    particles.push({ x,y, vx:Math.cos(a)*s, vy:Math.sin(a)*s,
+      life:life*(0.6+Math.random()*0.6), age:0,
+      col:colors[(Math.random()*colors.length)|0], size:size*(0.6+Math.random()*0.8) });
+  }
+}
+
+/* =====================================================================
+   PHYSICS
+   ===================================================================== */
+function restoreBallSpeed(b){
+  let sp=Math.hypot(b.vx,b.vy);
+  if(!Number.isFinite(sp) || sp<0.001){
+    const dir = b.owner===0 ? -1 : (b.owner===1 ? 1 : (b.y<H/2 ? 1 : -1));
+    b.vx = 0; b.vy = minSpeed()*dir;
+    return;
+  }
+  if(sp>MAX_SPEED){ const s=MAX_SPEED/sp; b.vx*=s; b.vy*=s; sp=MAX_SPEED; }
+  const ms=minSpeed();
+  if(sp<ms){ const s=ms/sp; b.vx*=s; b.vy*=s; }
+}
+function applyMagnus(b,dt){
+  // Magnus force = perpendicular to velocity, proportional to spin × speed
+  // Signs are flipped vs textbook because canvas y points DOWN, which
+  // inverts the cross-product.  This makes CCW spin on an upward ball
+  // curve toward the sweep direction (rightward for a rightward sweep).
+  const ax =  K_MAGNUS * b.spin * b.vy;
+  const ay = -K_MAGNUS * b.spin * b.vx;
+  b.vx += ax*dt; b.vy += ay*dt;
+  // in-flight spin decay (air resistance bleeds angular momentum)
+  b.spin *= Math.exp(-SPIN_DECAY * dt);
+}
+
+/* ── Shared contact-point friction for both walls and paddles ── */
+function applyContactFriction(v_t, spin, Jn, mu){
+  // slip = tangential velocity of contact point (center + spin surface speed)
+  const slip = v_t - spin * SPIN_SURFACE;
+  if(Math.abs(slip) < 1) return { v_t, spin };  // negligible slip
+  const maxFric = mu * Jn;
+  // Velocity/spin split in grip case. Tuned for gameplay: only 18% of slip
+  // becomes lateral velocity (so the ball doesn't rocket sideways off the paddle);
+  // the rest drives spin change, which curves the ball gradually via Magnus.
+  const V_COUPLING = 0.15, S_COUPLING = 0.85;
+  const gripV = V_COUPLING * Math.abs(slip);
+  if(gripV <= maxFric){
+    // GRIP — friction eliminates slip, ball rolls off the surface
+    return {
+      v_t:  v_t  - V_COUPLING * slip,
+      spin: spin + S_COUPLING * slip / SPIN_SURFACE
+    };
+  } else {
+    // SLIDING — Coulomb-limited friction, partial slip arrest
+    const s = Math.sign(slip);
+    return {
+      v_t:  v_t  - s * maxFric,
+      spin: spin + s * (1/V_COUPLING) * maxFric / SPIN_SURFACE  // mirror grip ratio
+    };
+  }
+}
+
+function bounceWall(b, side){
+  // Reflect off the actual angled wall using its true normal.
+  const inset = wallSlope * W;
+  let nx = (side==='left') ? H : -H;
+  let ny = -inset;
+  const L = Math.hypot(nx, ny) || 1;
+  nx /= L; ny /= L;
+  // Tangent direction along wall surface
+  const tx = -ny, ty = nx;
+  // Decompose velocity into normal + tangential
+  const v_n = b.vx*nx + b.vy*ny;
+  const v_t = b.vx*tx + b.vy*ty;
+  // Normal reflection with restitution
+  const v_n_new = -WALL_REST * v_n;
+  // Contact-point friction (normal impulse drives Coulomb cap)
+  const Jn = Math.abs(v_n) * (1 + WALL_REST);
+  const fr = applyContactFriction(v_t, b.spin, Jn, WALL_MU);
+  b.spin = clamp(fr.spin * CONTACT_SPIN_DAMP, -SPIN_MAX, SPIN_MAX);
+  // Reconstruct velocity
+  b.vx = v_n_new*nx + fr.v_t*tx;
+  b.vy = v_n_new*ny + fr.v_t*ty;
+  emit('wall',{x:b.x,y:b.y});
+}
+function bouncePaddle(b,pad,isPlayer){
+  const dir = isPlayer? -1:1;   // player sends up(-), ai sends down(+)
+  const padV = motionVel(pad);
+  // speed up slightly, cap
+  let spd = Math.hypot(b.vx,b.vy)*RALLY_SPEEDUP;
+  spd = Math.min(spd, MAX_SPEED);
+
+  // ═══════════════════════════════════════════════════════════════════
+  // CONTACT-POINT FRICTION in the paddle's reference frame
+  //
+  // Step into paddle frame: relative tangential velocity = vx − padV.
+  // The contact point slip = (vx − padV) − spin × SPIN_SURFACE.
+  // Friction on this slip drives BOTH the lateral velocity change AND the
+  // spin change — they are one and the same impulse.
+  //
+  // Coulomb cap uses the normal impulse: |vy| × 2 (e≈1 for paddle).
+  // This naturally scales friction by how head-on the hit is —
+  // grazing shots have low normal force → low friction cap → less spin.
+  // ═══════════════════════════════════════════════════════════════════
+
+  const v_t_rel = b.vx - padV;
+  const v_n = Math.abs(b.vy);                // normal approach speed
+  const Jn = v_n * 2;                         // normal impulse (e≈1)
+
+  const fr = applyContactFriction(v_t_rel, b.spin, Jn, PAD_MU);
+  b.spin = clamp(fr.spin * CONTACT_SPIN_DAMP, -SPIN_MAX, SPIN_MAX);
+
+  // Reconstruct: add paddle velocity back, clamp vx, derive vy from speed budget
+  b.vx = fr.v_t + padV;
+  // Cap launch angle: a flat paddle can't send a ball nearly sideways.
+  // 0.55 × spd caps at ~33° from vertical, guaranteeing vy ≥ 84% of speed.
+  const vxMax = spd*0.55;
+  b.vx = clamp(b.vx,-vxMax,vxMax);
+  const vyMag = Math.sqrt(Math.max(spd*spd-b.vx*b.vx, minSpeed()*minSpeed()*0.25));
+  b.vy = dir*vyMag;
+
+  // detach from leader if trailing
+  if(b.leader){ b.leader=null; b.detached=true; }
+  // track who last hit this specific ball
+  b.owner = isPlayer?0:1;
+  b.hitTime = gameTime;   // for slope re-derivation when another ball dies
+  // effects
+  rallyHits++;
+  emit('paddle',{x:b.x,y:b.y,spin:b.spin,player:isPlayer});
+  // spawn token on every hit
+  spawnToken();
+  lastHitter = isPlayer?0:1;
+  setSlopeTarget();   // AFTER lastHitter is updated!
+  tokenStreak=0;     // reset streak for next pass
+}
+
+/* =====================================================================
+   AI
+   ===================================================================== */
+function aiDifficulty(){
+  const t=Math.min(gameTime/70,0.55);
+  const rubber=Math.max(0,(pScore-aScore))*0.06;
+  return Math.min(0.92, 0.32+t+rubber);
+}
+function aiUseEnergy(){
+  // AI spends energy on abilities when it makes tactical sense
+  if(ai.energy>=GROW_COST && ai.growT<=0){
+    const incoming=balls.some(b=>b.alive&&b.vy<0);
+    if(incoming && simRand()<0.02){
+      ai.energy-=GROW_COST; ai.growT=GROW_DUR;
+      emit('ability',{shake:4,burst:true,bx:ai.x,by:ai.y,n:10,colors:['#fbbf24','#fff'],spd:140,sz:3,life:0.4});
+    }
+  }
+  if(ai.energy>=SLOW_COST && ai.slowT<=0){
+    const incoming=balls.filter(b=>b.alive&&b.vy<0).length;
+    if(incoming>=1 && simRand()<0.015){
+      ai.energy-=SLOW_COST; ai.slowT=SLOW_DUR;
+      emit('ability',{shake:4,burst:true,bx:W/2,by:H*0.25,n:12,colors:['#c084fc','#fff'],spd:160,sz:3,life:0.5});
+    }
+  }
+  if(ai.energy>=SPLIT_COST){
+    if(simRand()<0.008 && balls.filter(b=>b.alive&&(!b.leader||b.detached)).length===1){
+      if(doSplit()){
+        ai.energy-=SPLIT_COST;
+        emit('ability',{shake:6});
+      }
+    }
+  }
+  if(ai.energy>=MOVE_COST){
+    // move eater away from AI's side or toward player's tokens
+    if(simRand()<0.01){
+      ai.energy-=MOVE_COST; resetEater();
+      emit('ability',{shake:5,burst:true,bx:eater.cx,by:eater.cy,n:16,colors:['#ff3344','#fff'],spd:200,sz:4,life:0.5});
+    }
+  }
+}
+
+function aiUpdate(dt){
+  const a=aiDifficulty();
+
+  // ── Evaluate ALL balls heading toward AI, predict arrival time + x position ──
+  let threats=[];
+  for(const b of balls){
+    if(!b.alive || b.vy>=0) continue;
+    if(b.leader && !b.detached) continue; // trailing balls that haven't detached
+    // predict landing x with wall reflection
+    let px=b.x, py=b.y, vx=b.vx, vy=b.vy;
+    let guard=0;
+    while(py>ai.y+ai.h && guard<3000){
+      guard++; py+=vy*0.014; px+=vx*0.014;
+      if(px<wallLeftAt(py)){px=wallLeftAt(py)+(wallLeftAt(py)-px); vx=Math.abs(vx);}
+      if(px>wallRightAt(py)){px=wallRightAt(py)-(px-wallRightAt(py)); vx=-Math.abs(vx);}
+      if(py<=ai.y+ai.h) break;
+    }
+    // estimate time to arrive (distance / speed)
+    const dist = b.y - (ai.y+ai.h);
+    const spd = Math.hypot(b.vx,b.vy);
+    const eta = dist>0 ? dist/Math.abs(b.vy) : 0;
+    threats.push({x:px, eta, dist});
+  }
+
+  let tx=W/2;
+  if(threats.length>0){
+    // Sort by arrival time (most urgent first)
+    threats.sort((p,q)=>p.eta-q.eta);
+    const urgent = threats[0];
+    // Add error based on difficulty
+    const err=(1-a)*200;
+    tx = urgent.x + (simRand()*2-1)*err;
+
+    // If there are multiple threats, try to position between them
+    if(threats.length>1){
+      // Weighted average: favor the most urgent, but bias toward covering the cluster
+      let avgX=0, totalW=0;
+      for(const t of threats){
+        // weight decays with how much later this ball arrives
+        const w = 1/(1+(t.eta-urgent.eta)*3);
+        avgX += t.x*w;
+        totalW += w;
+      }
+      if(totalW>0){
+        const clusterX = avgX/totalW;
+        // blend: mostly toward the urgent ball, partly toward cluster center
+        tx = tx*0.6 + clusterX*0.4 + (simRand()*2-1)*err*0.5;
+      }
+    }
+  }
+
+  const maxspd=220+a*380;
+  const diff=tx-ai.x;
+  const move=Math.sign(diff)*Math.min(Math.abs(diff),maxspd*dt);
+  ai.x+=move; ai.vx=move/dt;
+  ai.x=clamp(ai.x, ai.w/2+wallLeftAt(ai.y), wallRightAt(ai.y)-ai.w/2);
+}
+
+/* =====================================================================
+   UPDATE
+   ===================================================================== */
+function update(dt){
+  gameTime+=dt;
+
+  // ease wall slope toward target (~2s transition)
+  const rate = 1/WALL_TRANSITION;
+  wallSlope += (wallSlopeTarget - wallSlope) * Math.min(1, dt*rate*3);
+  if(wallSlopeLockT>0) wallSlopeLockT-=dt;
+
+  // player paddle
+  let kbd=0;
+  if(input.left)kbd-=1; if(input.right)kbd+=1;
+  if(kbd!==0) player.x+=kbd*540*dt;
+  else player.x+=(input.targetX-player.x)*Math.min(1,dt*22);
+  const pw=player.growT>0?player.baseW*GROW_MULT:player.baseW;
+  player.w+=(pw-player.w)*Math.min(1,dt*12);
+  player.x=clamp(player.x, player.w/2+wallLeftAt(player.y), wallRightAt(player.y)-player.w/2);
+  player.vx=clamp((player.x-(player._px||player.x))/dt,-900,900);
+  player._px=player.x;
+  recordHist(player);
+  if(player.growT>0)player.growT-=dt;
+  if(player.slowT>0)player.slowT-=dt;
+
+  // ai paddle
+  aiUpdate(dt);
+  aiUseEnergy();
+  const aw = ai.growT>0?ai.baseW*GROW_MULT:ai.baseW;
+  ai.w += (aw-ai.w)*Math.min(1,dt*12);
+  if(ai.growT>0) ai.growT-=dt;
+  if(ai.slowT>0) ai.slowT-=dt;
+  recordHist(ai);
+
+  // eater orbit
+  eater.ang += EATER_ORBIT_SPD*dt;
+  eater.x = eater.cx + Math.cos(eater.ang)*EATER_ORBIT_R;
+  eater.y = eater.cy + Math.sin(eater.ang)*EATER_ORBIT_R;
+  if(eater.flash>0) eater.flash-=dt*2;
+
+  // balls
+  for(const b of balls){
+    if(!b.alive) continue;
+    const trailing = b.leader && !b.detached;
+
+    if(trailing){
+      // ── trailing ball: follow leader's recorded path (no independent physics) ──
+      const lp=b.leader.path;
+      if(lp.length>1){
+        const pp=sampleBallPath(lp, gameTime-b.leaderDelay, {x:b.x,y:b.y,t:gameTime,vx:b.vx,vy:b.vy,spin:b.spin});
+        b.x=pp.x; b.y=pp.y;
+        b.vx=pp.vx||0; b.vy=pp.vy||0; b.spin=pp.spin||0;
+        // detach when entering a paddle approach zone — the ball must be HIT
+        // by a real paddle to return, it can't auto-bounce from the path.
+        if(b.y > H*0.85 || b.y < H*0.15){
+          b.leader=null; b.detached=true;
+        }
+      }
+      b.trail.push({x:b.x,y:b.y,s:b.spin}); if(b.trail.length>20)b.trail.shift();
+      // ALSO record path so balls trailing THIS one can follow
+      b.path.push({x:b.x,y:b.y,t:gameTime,vx:b.vx,vy:b.vy,spin:b.spin});
+      if(b.path.length>120) b.path.shift();
+    } else {
+      // ── real ball: full physics ──
+      applyMagnus(b,dt);
+      // slow ability: decelerate balls approaching player
+      if(player.slowT>0 && b.vy>0 && b.y>H*0.45){
+        b.vx*=Math.pow(0.88,dt); b.vy*=Math.pow(0.88,dt);
+        restoreBallSpeed(b);
+      }
+      if(ai.slowT>0 && b.vy<0 && b.y<H*0.55){
+        b.vx*=Math.pow(0.88,dt); b.vy*=Math.pow(0.88,dt);
+        restoreBallSpeed(b);
+      }
+      b.spin *= Math.pow(SPIN_DECAY, dt);
+      // clamp speed and recover defensively from any zero/NaN velocity before
+      // integrating, so invalid velocity never contaminates position.
+      restoreBallSpeed(b);
+      // store previous position BEFORE moving (for swept collision)
+      b.px=b.x; b.py=b.y;
+      b.x += b.vx*dt;
+      b.y += b.vy*dt;
+      restoreBallSpeed(b);
+      // trail + path history
+      b.trail.push({x:b.x,y:b.y,s:b.spin}); if(b.trail.length>20)b.trail.shift();
+      b.path.push({x:b.x,y:b.y,t:gameTime,vx:b.vx,vy:b.vy,spin:b.spin});
+      if(b.path.length>120) b.path.shift();
+      // wall bounces — collision uses the SAME wall positions as drawing
+      const wl = wallLeftAt(b.y);
+      const wr = wallRightAt(b.y);
+      if(b.x-b.r < wl){ b.x = wl+b.r; bounceWall(b,'left'); }
+      if(b.x+b.r > wr){ b.x = wr-b.r; bounceWall(b,'right'); }
+    }
+
+    // ── COMMON checks for ALL balls (trailing + real) ──
+    // token collection
+    for(const tk of tokens){
+      if(!tk.dead && Math.hypot(b.x-tk.x,b.y-tk.y)<b.r+tk.r){ collectToken(tk,b); }
+    }
+    // energy eater
+    if(Math.hypot(b.x-eater.x,b.y-eater.y)<b.r+EATER_R){ hitEater(b); }
+    // paddle collisions
+    if(b.vy>0) doPaddleCheck(b,player,true);
+    if(b.vy<0) doPaddleCheck(b,ai,false);
+    // scoring
+    if(b.y<-30){ b.alive=false; pScore++; tokenStreak=0; onPoint(); }
+    else if(b.y>H+30){ b.alive=false; aScore++; tokenStreak=0; onPoint(); }
+  }
+  // cull dead balls
+  for(let i=balls.length-1;i>=0;i--) if(!balls[i].alive) balls.splice(i,1);
+
+  // if the ball that set the slope is gone, re-derive from remaining balls
+  if(balls.length>0){
+    let recent=null;
+    for(const b of balls){
+      if(b.alive && b.owner>=0 && b!==b.leader && (!recent || b.hitTime>recent.hitTime)) recent=b;
+    }
+    if(recent && recent.owner !== lastHitter){
+      lastHitter = recent.owner;
+      wallSlopeLockT=0;   // allow immediate update
+      setSlopeTarget();
+    }
+  }
+
+  // tokens (persist until collected — no expiry)
+  for(let i=tokens.length-1;i>=0;i--) if(tokens[i].dead) tokens.splice(i,1);
+
+  // win
+  if(pScore>=WIN_SCORE){ winner='YOU'; state='gameover'; emit('win'); shake=0; }
+  else if(aScore>=WIN_SCORE){ winner='CPU'; state='gameover'; emit('lose'); shake=0; }
+
+  // serve
+  if(serveTimer>0){ serveTimer-=dt; if(serveTimer<=0&&balls.length===0) resetBall(serveDir); }
+}
+// Swept paddle collision — checks the ENTIRE segment from prev to current
+// position, so the ball can NEVER tunnel through even at max speed.
+function doPaddleCheck(b,pad,isPlayer){
+  if(b.px===undefined) return;  // no prev position yet
+  const px=b.px, py=b.py;       // start of segment
+  const cx=b.x,  cy=b.y;        // end of segment
+  const surf = isPlayer ? pad.y-pad.h/2 : pad.y+pad.h/2;
+  const dir  = isPlayer ? 1 : -1;     // player catches ball going DOWN, ai going UP
+
+  // Quick reject: ball must be moving toward paddle
+  if(isPlayer && b.vy<=0) return;
+  if(!isPlayer && b.vy>=0) return;
+
+  // Quick reject: both points must be roughly within paddle x-range
+  const xMin=Math.min(px,cx)-b.r, xMax=Math.max(px,cx)+b.r;
+  if(xMax < pad.x-pad.w/2 || xMin > pad.x+pad.w/2) return;
+
+  // Find where the ball's TRAVEL PATH crosses the paddle surface line (y=surf)
+  // Segment from (px,py) to (cx,cy). Parametric: P(t) = lerp(prev, curr, t)
+  // Solve py + t*(cy-py) = surf ± b.r (approaching edge)
+  // We check the ball's leading edge:
+  //   player (ball going down): leading edge = y + r
+  //   ai (ball going up): leading edge = y - r
+  const leadOffset = isPlayer ? b.r : -b.r;
+  const y0 = py + leadOffset;   // leading edge at start
+  const y1 = cy + leadOffset;   // leading edge at end
+
+  // Did the leading edge cross surf between y0 and y1?
+  if(isPlayer){
+    // Ball going down: leading edge goes from y0 to y1, need it to reach surf
+    if(y1 < surf) return;       // hasn't reached paddle yet
+    if(y0 > surf + pad.h) return; // already past paddle (shouldn't happen with vy check)
+  } else {
+    // Ball going up: leading edge goes from y0 to y1, need it to reach surf
+    if(y1 > surf) return;
+    if(y0 < surf - pad.h) return;
+  }
+
+  // Compute the exact t where leading edge hits surf
+  let t;
+  if(Math.abs(y1-y0) < 0.0001) t = 0;
+  else t = (surf - y0) / (y1 - y0);
+  t = clamp(t, 0, 1);
+
+  // Where was the ball CENTER at that t?
+  const hitX = px + t*(cx-px);
+
+  // Check horizontal overlap at hit point
+  if(Math.abs(hitX - pad.x) > pad.w/2 + b.r) return;
+
+  // COLLISION — snap ball to surface and bounce
+  b.y = surf - leadOffset;
+  b.py = b.y;
+  bouncePaddle(b, pad, isPlayer);
+}
+function onPoint(){
+  rallyHits=0;
+  serveDir = (lastHitter===0)?1:-1;
+  serveTimer=0.9;
+  emit('score');
+}
+
+/* =====================================================================
+   DRAW
+   ===================================================================== */
+/* ---------- Visual update (cosmetic, not part of deterministic sim) ---------- */
+// Runs at display frame rate, not fixed timestep.
+function updateVisuals(dt){
+  // token bob
+  for(const tk of tokens){ tk.bob+=dt*3; }
+  // particles
+  for(const p of particles){ p.age+=dt; p.x+=p.vx*dt; p.y+=p.vy*dt; p.vx*=0.95; p.vy*=0.95; }
+  for(let i=particles.length-1;i>=0;i--) if(particles[i].age>=particles[i].life) particles.splice(i,1);
+  // floating texts
+  for(const ft of floatTexts){ ft.age+=dt; ft.y+=ft.vy*dt; ft.vy*=0.94; }
+  for(let i=floatTexts.length-1;i>=0;i--) if(floatTexts[i].age>=floatTexts[i].life) floatTexts.splice(i,1);
+  // screen shake decay
+  shake*=Math.pow(0.001,dt);
+  // energy flash
+  if(energyFlashT>0) energyFlashT-=dt;
+}
+
+function draw(){
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  drawBackdrop();
+  const sx=(Math.random()*2-1)*shake, sy=(Math.random()*2-1)*shake;
+  ctx.save();
+  ctx.translate(fx+sx,fy+sy); ctx.scale(scale,scale);
+  drawField();
+  drawEater();
+  drawTokens();
+  drawTrails();
+  drawBalls();
+  drawPaddle(ai,'#ff4da6','#ff7ad9',false);
+  drawPaddle(player,'#4de2ff','#7afcff',true);
+  drawParticles();
+  drawFloatTexts();
+  drawHUD();
+  ctx.restore();
+  if(state==='playing') drawSideButtons(true);
+  if(state==='menu'){
+    drawSideButtons(false);
+    ctx.save(); ctx.translate(fx,fy); ctx.scale(scale,scale); drawMenu(); ctx.restore();
+  }
+  if(state==='gameover'){
+    ctx.save(); ctx.translate(fx,fy); ctx.scale(scale,scale); drawGameOver(); ctx.restore();
+  }
+  if(paused && state==='playing'){
+    ctx.fillStyle='rgba(4,6,15,0.6)'; ctx.fillRect(0,0,vw,vh);
+    ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillStyle='#7afcff'; ctx.font='bold 40px system-ui';
+    ctx.fillText('PAUSED',vw/2,vh/2);
+    ctx.fillStyle='rgba(207,233,255,0.6)'; ctx.font='14px system-ui';
+    ctx.fillText('tap ▶ / press P',vw/2,vh/2+32);
+  }
+}
+function drawBackdrop(){
+  const g=ctx.createLinearGradient(0,0,0,vh);
+  g.addColorStop(0,'#070a1c'); g.addColorStop(0.5,'#070815'); g.addColorStop(1,'#04060f');
+  ctx.fillStyle=g; ctx.fillRect(0,0,vw,vh);
+  // subtle radial glow during menu
+  if(state==='menu'){
+    const pulse=0.5+0.5*Math.sin(gameTime*1.5);
+  const rg=ctx.createRadialGradient(vw/2,vh/2,0,vw/2,vh/2,vh*0.6);
+  rg.addColorStop(0,'rgba(40,80,140,'+(0.08+pulse*0.04)+')');
+  rg.addColorStop(0.5,'rgba(20,40,80,0.03)');
+  rg.addColorStop(1,'rgba(0,0,0,0)');
+  ctx.fillStyle=rg; ctx.fillRect(0,0,vw,vh);
+  }
+  ctx.save(); ctx.globalAlpha=0.5;
+  for(let i=0;i<46;i++){
+    const x=(i*97.13)%vw, y=((i*53.7+gameTime*8*(1+(i%3)*0.4))%(vh+10));
+    ctx.fillStyle='rgba(120,170,255,'+(0.05+(i%4)*0.02)+')';
+    ctx.fillRect(x,y,(i%3)+1,(i%3)+1);
+  }
+  ctx.restore();
+}
+function drawField(){
+  ctx.lineWidth=3; ctx.strokeStyle='rgba(90,224,255,0.2)';
+  ctx.shadowColor='#5be0ff'; ctx.shadowBlur=14;
+  // Draw walls using the EXACT same wallLeftAt/wallRightAt as collision
+  const topL=wallLeftAt(0), botL=wallLeftAt(H);
+  const topR=wallRightAt(0), botR=wallRightAt(H);
+  ctx.beginPath();
+  ctx.moveTo(topL,0); ctx.lineTo(botL,H);     // left wall
+  ctx.moveTo(topR,0); ctx.lineTo(botR,H);      // right wall
+  ctx.moveTo(topL,0); ctx.lineTo(topR,0);      // top edge
+  ctx.moveTo(botL,H); ctx.lineTo(botR,H);      // bottom edge
+  ctx.stroke();
+  ctx.shadowBlur=0;
+  // center line
+  ctx.strokeStyle='rgba(120,200,255,0.1)'; ctx.lineWidth=2; ctx.setLineDash([12,16]);
+  ctx.beginPath(); ctx.moveTo(0,H/2); ctx.lineTo(W,H/2); ctx.stroke(); ctx.setLineDash([]);
+}
+function roundRect(x,y,w,h,r){
+  ctx.beginPath(); ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+function drawPaddle(pad,c1,c2,isPlayer){
+  ctx.save();
+  ctx.shadowColor=c1; ctx.shadowBlur=18;
+  const g=ctx.createLinearGradient(0,pad.y-pad.h/2,0,pad.y+pad.h/2);
+  g.addColorStop(0,c2); g.addColorStop(1,c1);
+  ctx.fillStyle=g;
+  roundRect(pad.x-pad.w/2,pad.y-pad.h/2,pad.w,pad.h,6); ctx.fill();
+  ctx.shadowBlur=0;
+  ctx.fillStyle='rgba(255,255,255,0.3)';
+  ctx.fillRect(pad.x-pad.w/2+4,pad.y-pad.h/2+2,pad.w-8,2);
+  // ── motion-to-spin indicator: an arrow/trail showing paddle velocity ──
+  const mv=motionVel(pad);
+  const mvNorm=clamp(mv/600,-1,1); // normalize for display
+  if(Math.abs(mvNorm)>0.03){
+    const barLen=pad.w*0.4*Math.abs(mvNorm);
+    const barY=pad.y;
+    const barX=pad.x + (mvNorm>0? pad.w*0.08 : -pad.w*0.08 - barLen);
+    const col=mvNorm>0?SPIN_CW_COL:SPIN_CCW_COL; // gold=right sweep, violet=left sweep
+    ctx.fillStyle=col;
+    ctx.shadowColor=col; ctx.shadowBlur=8;
+    roundRect(barX, barY-2, barLen, 4, 2); ctx.fill();
+    // arrowhead
+    const tipX=mvNorm>0? barX+barLen : barX;
+    const dir=mvNorm>0?1:-1;
+    ctx.beginPath();
+    ctx.moveTo(tipX+dir*6, barY); ctx.moveTo(tipX, barY-4); ctx.lineTo(tipX, barY+4);
+    ctx.lineTo(tipX+dir*6, barY); ctx.fill();
+    ctx.shadowBlur=0;
+  }
+  // grow/slow glow (both players)
+  if(pad.growT>0){ ctx.strokeStyle='rgba(251,191,36,0.5)'; ctx.lineWidth=2;
+    roundRect(pad.x-pad.w/2-2,pad.y-pad.h/2-2,pad.w+4,pad.h+4,7); ctx.stroke(); }
+  if(pad.slowT>0){ ctx.strokeStyle='rgba(192,132,252,0.4)'; ctx.lineWidth=2;
+    ctx.setLineDash([6,6]); roundRect(pad.x-pad.w/2-2,pad.y-pad.h/2-2,pad.w+4,pad.h+4,7); ctx.stroke(); ctx.setLineDash([]); }
+  ctx.restore();
+}
+function drawTrails(){
+  for(const b of balls){
+    if(b.trail.length<2) continue;
+    ctx.save(); ctx.lineCap='round'; ctx.lineJoin='round';
+    // dupes get greyer trails
+    const grey = 255 - b.dupIndex*40;
+    for(let i=1;i<b.trail.length;i++){
+      const p0=b.trail[i-1],p1=b.trail[i], a=i/b.trail.length;
+      ctx.globalAlpha=a*0.6; ctx.lineWidth=b.r*1.4*a;
+      const s=p1.s||0;
+      ctx.strokeStyle = Math.abs(s)>1
+        ? (s>0?'#fbbf24':'#c084fc')   // gold=CW, violet=CCW
+        : 'rgba('+grey+','+grey+','+grey+',1)';
+      ctx.beginPath(); ctx.moveTo(p0.x,p0.y); ctx.lineTo(p1.x,p1.y); ctx.stroke();
+    }
+    ctx.restore();
+  }
+  ctx.globalAlpha=1;
+}
+// Spin colors: gold = clockwise, violet = counterclockwise
+const SPIN_CW_COL = '#fbbf24';
+const SPIN_CCW_COL = '#c084fc';
+function spinColor(spin){ return spin>0 ? SPIN_CW_COL : SPIN_CCW_COL; }
+
+function drawBalls(){
+  for(let bi=0; bi<balls.length; bi++){
+    const b = balls[bi];
+    if(!b.alive) continue;
+    ctx.save();
+    const spinMag = Math.abs(b.spin);
+    // ── ball body: white for original, progressively greyer for dupes ──
+    // Always keep a pure white border so grey dupes are still visible
+    const grey = Math.max(120, 255 - b.dupIndex*45);
+    const innerCol = b.dupIndex===0 ? '#ffffff' : 'rgb('+grey+','+grey+','+grey+')';
+    const g = ctx.createRadialGradient(b.x-3,b.y-3,1,b.x,b.y,b.r);
+    g.addColorStop(0, innerCol);
+    g.addColorStop(1, b.dupIndex===0 ? '#e8e8e8' : 'rgb('+(grey-30)+','+(grey-30)+','+(grey-30)+')');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(b.x,b.y,b.r,0,6.283); ctx.fill();
+    // border colored by who last hit this ball (cyan=player, magenta=AI, white=neutral serve)
+    const ownerCol = b.owner===0 ? '#4de2ff' : (b.owner===1 ? '#ff4da6' : '#ffffff');
+    ctx.strokeStyle = ownerCol;
+    ctx.lineWidth = 2;
+    ctx.shadowColor = ownerCol; ctx.shadowBlur = 6;
+    ctx.beginPath(); ctx.arc(b.x,b.y,b.r,0,6.283); ctx.stroke();
+    ctx.shadowBlur = 0;
+
+    // ── spin indicator: orbiting dot + curve arrow ──
+    if(b._spinAng===undefined) b._spinAng=0;
+    b._spinAng += b.spin*0.35;
+    if(spinMag>0.15){
+      const col = spinColor(b.spin);
+      // orbiting dot
+      const dotX = b.x + Math.cos(b._spinAng) * (b.r*0.55);
+      const dotY = b.y + Math.sin(b._spinAng) * (b.r*0.55);
+      ctx.fillStyle = col;
+      ctx.globalAlpha = clamp(spinMag/2, 0.4, 1);
+      ctx.beginPath(); ctx.arc(dotX, dotY, b.r*0.4, 0, 6.283); ctx.fill();
+      ctx.globalAlpha=1;
+      // curve-direction arrow
+      const spd = Math.hypot(b.vx,b.vy)||1;
+      const cx = b.spin*b.vy/spd;
+      const cy = -b.spin*b.vx/spd;
+      const cLen = Math.hypot(cx,cy);
+      if(cLen>0.05 && spinMag>0.3){
+        const arrLen = clamp(spinMag*4, 4, 14);
+        const nx=cx/cLen, ny=cy/cLen;
+        const ax=b.x+nx*(b.r+2), ay=b.y+ny*(b.r+2);
+        const tx=b.x+nx*(b.r+2+arrLen), ty=b.y+ny*(b.r+2+arrLen);
+        ctx.strokeStyle=col; ctx.lineWidth=2; ctx.lineCap='round';
+        ctx.beginPath(); ctx.moveTo(ax,ay); ctx.lineTo(tx,ty); ctx.stroke();
+        const perpX=-ny, perpY=nx;
+        ctx.beginPath();
+        ctx.moveTo(tx,ty);
+        ctx.lineTo(tx-perpX*4-nx*3, ty-perpY*4-ny*3);
+        ctx.lineTo(tx+perpX*4-nx*3, ty+perpY*4-ny*3);
+        ctx.closePath(); ctx.fillStyle=col; ctx.fill();
+      }
+    }
+    ctx.restore();
+  }
+}
+function drawEater(){
+  ctx.save();
+  const flashAmt = Math.max(0,eater.flash);
+  // outer glow
+  const r=EATER_R*(1+flashAmt*0.3);
+  const og=ctx.createRadialGradient(eater.x,eater.y,0,eater.x,eater.y,r*1.8);
+  og.addColorStop(0,'rgba(255,0,51,'+(0.3+flashAmt*0.4)+')');
+  og.addColorStop(0.5,'rgba(160,0,30,'+(0.12+flashAmt*0.2)+')');
+  og.addColorStop(1,'rgba(0,0,0,0)');
+  ctx.fillStyle=og; ctx.beginPath(); ctx.arc(eater.x,eater.y,r*1.8,0,6.283); ctx.fill();
+  // jagged body — a spiky star that rotates
+  const rot=gameTime*1.5;
+  ctx.shadowColor='#ff0033'; ctx.shadowBlur=16;
+  ctx.fillStyle= flashAmt>0.3?'#ff0033':'#2a0008';
+  ctx.strokeStyle='#ff0033'; ctx.lineWidth=2;
+  ctx.beginPath();
+  const spikes=8;
+  for(let i=0;i<=spikes*2;i++){
+    const a=rot+(i/(spikes*2))*6.283;
+    const rad=(i%2===0)?r:r*0.55;
+    const px=eater.x+Math.cos(a)*rad, py=eater.y+Math.sin(a)*rad;
+    if(i===0)ctx.moveTo(px,py); else ctx.lineTo(px,py);
+  }
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.shadowBlur=0;
+  // inner void
+  ctx.fillStyle='#0a0004';
+  ctx.beginPath(); ctx.arc(eater.x,eater.y,r*0.35,0,6.283); ctx.fill();
+  ctx.restore();
+}
+function drawTokens(){
+  for(const tk of tokens){
+    const yo=Math.sin(tk.bob)*5;
+    ctx.save(); ctx.globalAlpha=1; ctx.translate(tk.x,tk.y+yo);
+    ctx.shadowColor='#ffd166'; ctx.shadowBlur=14;
+    ctx.fillStyle='#1a1408'; ctx.strokeStyle='#ffd166'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.arc(0,0,tk.r,0,6.283); ctx.fill(); ctx.stroke();
+    ctx.shadowBlur=0; ctx.fillStyle='#ffd166';
+    ctx.font='bold 18px system-ui'; ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText('⚡',0,1);
+    ctx.restore();
+  }
+}
+function drawParticles(){
+  for(const p of particles){
+    const a=1-p.age/p.life; ctx.globalAlpha=Math.max(0,a);
+    ctx.fillStyle=p.col; ctx.beginPath(); ctx.arc(p.x,p.y,p.size*a,0,6.283); ctx.fill();
+  }
+  ctx.globalAlpha=1;
+}
+function drawFloatTexts(){
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  for(const ft of floatTexts){
+    const a=1-ft.age/ft.life;
+    ctx.globalAlpha=a;
+    ctx.fillStyle=ft.col;
+    ctx.font='bold '+ft.size+'px system-ui';
+    ctx.fillText(ft.text, ft.x, ft.y);
+  }
+  ctx.globalAlpha=1;
+}
+function drawHUD(){
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  // scores
+  ctx.font='bold 52px system-ui';
+  ctx.fillStyle='rgba(255,93,166,0.85)'; ctx.fillText(aScore,W*0.5,128);
+  ctx.fillStyle='rgba(74,226,255,0.92)'; ctx.fillText(pScore,W*0.5,H-128);
+  ctx.font='11px system-ui'; ctx.fillStyle='rgba(255,255,255,0.35)';
+  ctx.fillText('CPU',W/2,162);
+
+  // opponent energy (big, between paddle and board edge)
+  ctx.font='bold 26px system-ui';
+  ctx.fillStyle='rgba(255,209,102,0.75)';
+  ctx.fillText('⚡'+Math.floor(ai.energy),W/2,30);
+  // player energy — 2x bigger + red flash when energy is drained
+  const ef = energyFlashT>0;
+  if(ef){ energyFlashT-=1/60; }
+  const flashPulse = ef ? 0.5+0.5*Math.sin(gameTime*30) : 0;
+  ctx.font='bold 26px system-ui';
+  if(ef){
+    ctx.shadowColor='#ff0033'; ctx.shadowBlur=12;
+    ctx.fillStyle = 'rgba('+(255)+','+(Math.floor(40+flashPulse*80))+','+(50)+',1)';
+  } else {
+    ctx.shadowBlur=0;
+    ctx.fillStyle='rgba(255,209,102,0.85)';
+  }
+  ctx.fillText('⚡'+Math.floor(player.energy),W/2,H-28);
+  ctx.shadowBlur=0;
+
+}
+function drawMenu(){
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  // glowing title
+  const titleGlow = 0.7 + 0.3*Math.sin(gameTime*2);
+  ctx.save();
+  ctx.shadowColor='#5be0ff'; ctx.shadowBlur=20+titleGlow*20;
+  ctx.fillStyle='#7afcff'; ctx.font='bold 72px system-ui';
+  ctx.fillText('VOLT',W/2,H*0.22);
+  ctx.restore();
+  // glowing subtitle
+  ctx.save();
+  ctx.shadowColor='#7afcff'; ctx.shadowBlur=10;
+  ctx.fillStyle='rgba(207,233,255,0.8)'; ctx.font='15px system-ui';
+  ctx.fillText('Spin Pong',W/2,H*0.22+44);
+  ctx.restore();
+
+  // glowing rules
+  ctx.save();
+  ctx.shadowColor='#7afcff'; ctx.shadowBlur=6;
+  ctx.fillStyle='rgba(207,233,255,0.7)'; ctx.font='13px system-ui'; ctx.textAlign='center';
+  const rules=[
+    'Sweep paddle to SPIN the ball.',
+    'Curve through \u26a1 tokens for energy.',
+    'Abilities cost 10 energy each \u2014 see left panel.',
+    '\u2727 MOVE relocates the energy eater.',
+    'First to '+WIN_SCORE+' wins.',
+  ];
+  rules.forEach((l,i)=>ctx.fillText(l,W/2,H*0.42+i*22));
+  ctx.restore();
+
+  // glowing play prompt
+  const pu=0.6+0.4*Math.sin(gameTime*3);
+  ctx.save();
+  ctx.globalAlpha=pu;
+  ctx.shadowColor='#ffd166'; ctx.shadowBlur=12+pu*8;
+  ctx.fillStyle='#ffd166'; ctx.font='bold 22px system-ui';
+  ctx.fillText('TAP / ENTER FOR 1 PLAYER',W/2,H*0.72);
+  ctx.restore();
+  ctx.globalAlpha=1;
+
+  ctx.globalAlpha=1;
+}
+function drawGameOver(){
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  const win=winner==='YOU';
+  ctx.save(); ctx.shadowColor=win?'#7afcff':'#ff4da6'; ctx.shadowBlur=24;
+  ctx.fillStyle=win?'#7afcff':'#ff4da6'; ctx.font='bold 56px system-ui';
+  ctx.fillText(win?'VICTORY!':'DEFEATED',W/2,H/2-40); ctx.restore();
+  ctx.fillStyle='rgba(207,233,255,0.85)'; ctx.font='28px system-ui';
+  ctx.fillText(pScore+'  :  '+aScore,W/2,H/2+16);
+  const pu=0.6+0.4*Math.sin(gameTime*3);
+  ctx.globalAlpha=pu; ctx.fillStyle='#ffd166'; ctx.font='bold 20px system-ui';
+  ctx.fillText('TAP / ENTER TO PLAY AGAIN',W/2,H/2+70); ctx.globalAlpha=1;
+}
+
+/* ---------- Lifecycle ---------- */
+/* ---------- Save / Restore (for rollback netcode) ---------- */
+// Captures ALL simulation state into a plain object.
+// Visual-only state (particles, floatTexts, shake) is NOT saved —
+// those are reconstructed from the event queue during re-simulation.
+function saveState(){
+  return {
+    // scalars
+    seed: _simSeed,
+    pScore, aScore, rallyHits, lastHitter, tokenStreak,
+    gameTime, serveTimer, serveDir,
+    wallSlope, wallSlopeTarget, wallSlopeLockT,
+    state: state,
+    // player
+    player: snapPaddle(player),
+    ai: snapPaddle(ai),
+    // balls (leader refs → index)
+    balls: balls.map(b => snapBall(b)),
+    // tokens
+    tokens: tokens.map(tk => ({ x:tk.x, y:tk.y, r:tk.r, dead:tk.dead, collected:tk.collected, bob:tk.bob })),
+    // eater
+    eater: { cx:eater.cx, cy:eater.cy, ang:eater.ang, flash:eater.flash },
+  };
+}
+function snapPaddle(p){
+  return { x:p.x, w:p.w, vx:p.vx, _px:p._px||p.x, baseW:p.baseW,
+           growT:p.growT, slowT:p.slowT, energy:p.energy,
+           hist: p.hist.map(h=>({x:h.x,t:h.t})) };
+}
+function snapBall(b){
+  return { x:b.x, y:b.y, vx:b.vx, vy:b.vy, r:b.r, spin:b.spin, alive:b.alive,
+           px:b.px, py:b.py, owner:b.owner, hitTime:b.hitTime,
+           leaderIdx: b.leader ? balls.indexOf(b.leader) : -1,
+           leaderDelay:b.leaderDelay, detached:b.detached, dupIndex:b.dupIndex,
+           trail: b.trail.map(t=>({x:t.x,y:t.y,s:t.s})),
+           path: b.path.map(t=>({x:t.x,y:t.y,t:t.t,vx:t.vx,vy:t.vy,spin:t.spin})) };
+}
+
+function loadState(s){
+  _simSeed   = s.seed;
+  pScore     = s.pScore;  aScore   = s.aScore;
+  rallyHits  = s.rallyHits; lastHitter = s.lastHitter;
+  tokenStreak= s.tokenStreak;
+  gameTime   = s.gameTime; serveTimer = s.serveTimer; serveDir = s.serveDir;
+  wallSlope  = s.wallSlope; wallSlopeTarget = s.wallSlopeTarget;
+  wallSlopeLockT = s.wallSlopeLockT;
+  state      = s.state;
+
+  restorePaddle(player, s.player);
+  restorePaddle(ai, s.ai);
+
+  // restore balls (index → leader ref)
+  balls.length = 0;
+  for(const bs of s.balls){
+    balls.push(makeBall(bs.x, bs.y, bs.vx, bs.vy));
+  }
+  for(let i=0;i<s.balls.length;i++){
+    const bs=s.balls[i], b=balls[i];
+    b.r=bs.r; b.spin=bs.spin; b.alive=bs.alive;
+    b.px=bs.px; b.py=bs.py; b.owner=bs.owner; b.hitTime=bs.hitTime;
+    b.leader = bs.leaderIdx>=0 ? balls[bs.leaderIdx] : null;
+    b.leaderDelay=bs.leaderDelay; b.detached=bs.detached; b.dupIndex=bs.dupIndex;
+    b.trail = bs.trail.map(t=>({x:t.x,y:t.y,s:t.s}));
+    b.path  = bs.path.map(t=>({x:t.x,y:t.y,t:t.t,vx:t.vx,vy:t.vy,spin:t.spin}));
+  }
+
+  // tokens
+  tokens.length = 0;
+  for(const ts of s.tokens){
+    tokens.push({ x:ts.x, y:ts.y, r:ts.r, dead:ts.dead, collected:ts.collected, bob:ts.bob });
+  }
+
+  // eater
+  eater.cx=s.eater.cx; eater.cy=s.eater.cy; eater.ang=s.eater.ang;
+  eater.flash=s.eater.flash;
+  eater.x = eater.cx + Math.cos(eater.ang)*EATER_ORBIT_R;
+  eater.y = eater.cy + Math.sin(eater.ang)*EATER_ORBIT_R;
+}
+function restorePaddle(p, ps){
+  p.x=ps.x; p.w=ps.w; p.vx=ps.vx; p._px=ps._px; p.baseW=ps.baseW;
+  p.growT=ps.growT; p.slowT=ps.slowT; p.energy=ps.energy;
+  p.hist = ps.hist.map(h=>({x:h.x,t:h.t}));
+}
+
+/* =====================================================================
+   MULTIPLAYER — Room-code signaling + lockstep with input delay
+   =====================================================================
+   Connection flow:
+     1. Host creates room via signaling server → gets 4-letter code
+     2. Guest enters code → server relays WebRTC SDP/ICE between them
+     3. WebRTC DataChannel connects P2P
+     4. Host sends shared seed → both start identical deterministic sims
+   Frame sync:
+     - Each frame, both peers capture local input and send to remote
+     - Input is applied MP_INPUT_DELAY frames later (gives remote time)
+     - If remote input for a frame hasn't arrived → stall
+   ===================================================================== */
+
+function startGame(seed){
+  audioInit(); if(AC&&AC.state==='suspended')AC.resume();
+  // Seed PRNG: explicit seed for multiplayer/replay, Date.now() for single-player variety.
+  _simSeed = (seed !== undefined) ? (seed >>> 0) : ((Date.now() ^ 0x6D2B79F5) >>> 0);
+  pScore=0;aScore=0;rallyHits=0;gameTime=0;shake=0;hitstop=0;
+  player.energy=0;player.growT=0;player.slowT=0;player.w=player.baseW;player.x=W/2;player.hist.length=0;
+  ai.x=W/2;ai.hist.length=0;ai.energy=0;ai.growT=0;ai.slowT=0;
+  balls.length=0;particles.length=0;tokens.length=0;floatTexts.length=0;
+  tokenStreak=0;lastHitter=0;
+  wallSlope=0;wallSlopeTarget=0;wallSlopeLockT=0;
+  resetEater();
+  serveDir=simRand()<0.5?1:-1;
+  resetBall(serveDir);
+  state='playing';
+  paused=false;
+  accumulator=0;
+  lastTime=0;
+}
+/* ---------- Fixed timestep (deterministic simulation) ---------- */
+// Physics always advances in FIXED_DT steps. Visual interpolation between
+// steps can be added later for smoothness; for now we just render the latest.
+const FIXED_DT = 1/60;
+let accumulator = 0;
+
+function loop(ts){
+  if(!lastTime)lastTime=ts;
+  let frameDt=(ts-lastTime)/1000; lastTime=ts;
+  frameDt=Math.min(frameDt,0.1);  // clamp huge spikes (tab switch)
+
+  if(state==='playing'&&!paused){
+    accumulator += frameDt;
+    while(accumulator >= FIXED_DT){
+      update(FIXED_DT);
+      processFx();
+      accumulator -= FIXED_DT;
+    }
+    updateVisuals(frameDt);
+  } else if(state!=='playing') {
+    gameTime+=frameDt;
+    updateVisuals(frameDt);
+  }
+  draw();
+  requestAnimationFrame(loop);
+}
+resize();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

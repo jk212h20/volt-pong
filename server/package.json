@@ -1,0 +1,13 @@
+{
+  "name": "voltpong-signaling",
+  "version": "1.0.0",
+  "description": "WebSocket signaling server for VOLT Spin Pong 2-player matchmaking",
+  "main": "signaling.js",
+  "scripts": {
+    "start": "node signaling.js",
+    "dev": "node signaling.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}
